@@ -1,7 +1,7 @@
 #!/bin/sh
 #
 # prepare-for-client.sh
-# v0.5
+# v0.6
 #
 # Запускать ПОСЛЕ:
 # - ручной настройки SSClash
@@ -14,6 +14,7 @@
 # - останавливает SSClash
 # - убирает SSClash из автозапуска
 # - ставит механизм первой активации
+# - ставит watchdog Mihomo
 # - после появления реального интернета запускает SSClash
 # - включает обычный автозапуск
 #
@@ -29,7 +30,6 @@
 # - если не получилось, следующий ifup/update или перезагрузка
 #   запустит цикл заново
 #
-
 set -u
 
 SERVICE="ssclash"
@@ -39,6 +39,10 @@ LOCKDIR="/tmp/ssclash-first-online.lock"
 ACTIVATION_LOG="/tmp/ssclash-first-online.log"
 PREP_LOG="/tmp/prepare-for-client.log"
 ARM_AFTER_REBOOT="/tmp/ssclash-wait-for-next-boot"
+
+WATCHDOG="/usr/bin/ssclash-watchdog"
+WATCHDOG_CRON="*/2 * * * * /usr/bin/ssclash-watchdog"
+WATCHDOG_FAIL="/tmp/ssclash-watchdog-fails"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$PREP_LOG"
@@ -74,10 +78,12 @@ if [ -f "$FLAG" ]; then
     echo "Найден флаг:"
     echo "  $FLAG"
     echo
+
     if ! confirm "Сбросить первую активацию и подготовить роутер заново?"; then
         echo "Отменено. Ничего не изменено."
         exit 0
     fi
+
     echo
 fi
 
@@ -108,6 +114,89 @@ log "Сбрасываю состояние предыдущей первой а�
 rm -f "$FLAG"
 rm -rf "$LOCKDIR"
 rm -f "$ACTIVATION_LOG"
+rm -f "$WATCHDOG_FAIL"
+
+# ============================================================
+# WATCHDOG MIHOMO
+# ============================================================
+
+log "Устанавливаю watchdog Mihomo..."
+
+cat > "$WATCHDOG" <<'EOF'
+#!/bin/sh
+
+SERVICE="ssclash"
+FLAG="/etc/ssclash_first_run_done"
+FAIL_FILE="/tmp/ssclash-watchdog-fails"
+
+API="http://127.0.0.1:9090/version"
+
+MAX_FAILS=3
+TIMEOUT=5
+
+# Пока первая успешная активация SSClash не выполнена,
+# watchdog ничего не делает.
+[ -f "$FLAG" ] || exit 0
+
+# Проверяем API Mihomo.
+if wget -q -T "$TIMEOUT" -O /dev/null "$API" 2>/dev/null; then
+    echo 0 > "$FAIL_FILE"
+    exit 0
+fi
+
+FAILS=0
+
+if [ -f "$FAIL_FILE" ]; then
+    FAILS="$(cat "$FAIL_FILE" 2>/dev/null)"
+fi
+
+case "$FAILS" in
+    ''|*[!0-9]*)
+        FAILS=0
+        ;;
+esac
+
+FAILS=$((FAILS + 1))
+echo "$FAILS" > "$FAIL_FILE"
+
+logger -t ssclash-watchdog \
+    "Mihomo API unavailable: $FAILS/$MAX_FAILS"
+
+if [ "$FAILS" -lt "$MAX_FAILS" ]; then
+    exit 0
+fi
+
+logger -t ssclash-watchdog \
+    "Mihomo appears stuck; restarting SSClash"
+
+/etc/init.d/"$SERVICE" restart
+
+sleep 10
+
+if wget -q -T "$TIMEOUT" -O /dev/null "$API" 2>/dev/null; then
+    logger -t ssclash-watchdog \
+        "SSClash recovered after restart"
+    echo 0 > "$FAIL_FILE"
+else
+    logger -t ssclash-watchdog \
+        "SSClash still unavailable after restart"
+fi
+
+exit 0
+EOF
+
+chmod 755 "$WATCHDOG"
+
+# Добавляем watchdog в cron только один раз.
+grep -qF "$WATCHDOG" /etc/crontabs/root 2>/dev/null || \
+    echo "$WATCHDOG_CRON" >> /etc/crontabs/root
+
+/etc/init.d/cron enable >> "$PREP_LOG" 2>&1 || true
+/etc/init.d/cron restart >> "$PREP_LOG" 2>&1 || true
+
+# ============================================================
+# FIRST ONLINE ACTIVATION
+# ============================================================
 
 mkdir -p /etc/hotplug.d/iface
 
@@ -164,6 +253,7 @@ attempt=1
 max_attempts=13
 
 while [ "$attempt" -le "$max_attempts" ]; do
+
     if [ -f "$FLAG" ]; then
         exit 0
     fi
@@ -177,9 +267,12 @@ while [ "$attempt" -le "$max_attempts" ]; do
         else
             # Флаг создаём ТОЛЬКО если команда запуска завершилась успешно.
             if /etc/init.d/$SERVICE start >> "$LOG" 2>&1; then
+
                 sleep 3
+
                 touch "$FLAG"
                 sync
+
                 echo "$(date) SSClash started; first activation completed" >> "$LOG"
                 exit 0
             else
@@ -199,15 +292,17 @@ while [ "$attempt" -le "$max_attempts" ]; do
 done
 
 echo "$(date) internet/SSClash not confirmed within 60 min; waiting for next interface event" >> "$LOG"
+
 exit 0
 EOF
 
 chmod 755 "$HOTPLUG"
 
 # На всякий случай ещё раз фиксируем нужное состояние после записи hotplug.
-# Это особенно полезно при замене более старой версии скрипта.
 rm -f "$FLAG"
 rm -rf "$LOCKDIR"
+rm -f "$WATCHDOG_FAIL"
+
 /etc/init.d/$SERVICE stop >> "$PREP_LOG" 2>&1 || true
 /etc/init.d/$SERVICE disable >> "$PREP_LOG" 2>&1 || true
 
@@ -215,6 +310,10 @@ log "Проверяю результат..."
 
 [ ! -f "$FLAG" ] || die "Флаг $FLAG неожиданно существует"
 [ -x "$HOTPLUG" ] || die "Hotplug-скрипт не создан или не исполняемый"
+[ -x "$WATCHDOG" ] || die "Watchdog не создан или не исполняемый"
+
+grep -qF "$WATCHDOG" /etc/crontabs/root \
+    || die "Watchdog не добавлен в cron"
 
 sync
 
@@ -223,10 +322,14 @@ echo "========================================"
 echo "       РОУТЕР ГОТОВ К ВЫДАЧЕ"
 echo "========================================"
 echo
-echo "SSClash:        ОСТАНОВЛЕН"
-echo "Автозапуск:     ВЫКЛЮЧЕН"
+echo "SSClash:          ОСТАНОВЛЕН"
+echo "Автозапуск:       ВЫКЛЮЧЕН"
 echo "Первая активация: СБРОШЕНА"
 echo "Активация сейчас: ЗАБЛОКИРОВАНА ДО ПЕРЕЗАГРУЗКИ"
+echo
+echo "Watchdog Mihomo:  УСТАНОВЛЕН"
+echo "Проверка API:     каждые 2 минуты"
+echo "Рестарт после:    3 ошибок подряд"
 echo
 echo "WAN можно оставить подключённым."
 echo "В текущей загрузке автоактивации не будет."
@@ -238,7 +341,8 @@ echo "  - далее каждые 5 минут;"
 echo "  - ожидание до 60 минут;"
 echo "  - SSClash запускается;"
 echo "  - автозапуск включается;"
-echo "  - создаётся флаг успешной активации."
+echo "  - создаётся флаг успешной активации;"
+echo "  - watchdog начинает контролировать Mihomo."
 echo
 echo "Если за час интернет не появился,"
 echo "цикл запустится снова при следующем"
@@ -252,4 +356,14 @@ echo "  $FLAG"
 echo
 echo "Hotplug:"
 echo "  $HOTPLUG"
+echo
+echo "Watchdog:"
+echo "  $WATCHDOG"
+echo
+echo "Проверить watchdog:"
+echo "  logread -e ssclash-watchdog"
+echo
+echo "Cron:"
+echo "  grep ssclash-watchdog /etc/crontabs/root"
+echo
 echo "========================================"
