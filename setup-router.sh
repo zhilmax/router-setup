@@ -12,10 +12,9 @@
 #  5) ставит hostname = SSID 2.4 и часовой пояс Europe/Moscow
 #  6) добавляет SSH public key
 #  7) включает и настраивает Wi-Fi WPA2
-#  8) устанавливает SSClash-Go
-#  9) меняет LAN 192.168.1.1 -> 192.168.31.1 В САМОМ КОНЦЕ
+#  8) меняет LAN 192.168.1.1 -> 192.168.31.1 В САМОМ КОНЦЕ
 #
-# SSClash после установки настраивается вручную.
+# SSClash устанавливается и настраивается вручную после этого скрипта.
 #
 
 set -u
@@ -28,8 +27,6 @@ ZONENAME="Europe/Moscow"
 ZEROTIER_NETWORK_ID="885033839050bb6a"
 
 SSH_PUBLIC_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOS17ax2MPBzALcOvBzw7ng8RATKOlIMkHpXTbdTclxr luci-key"
-
-SSCLASH_INSTALL_URL="https://github.com/zerolabnet/SSClash-Go/raw/refs/heads/main/install-ssclash-go.sh"
 
 LOG="/tmp/setup-router.log"
 BACKUP="/tmp/openwrt-before-setup-$(date '+%Y%m%d-%H%M%S').tar.gz"
@@ -249,13 +246,9 @@ install_ssh_key() {
     chmod 600 /etc/dropbear/authorized_keys
 
     if grep -Fqx "$SSH_PUBLIC_KEY" /etc/dropbear/authorized_keys; then
-
         log "SSH-ключ уже присутствует."
-
     else
-
         echo "$SSH_PUBLIC_KEY" >> /etc/dropbear/authorized_keys
-
         log "SSH-ключ добавлен."
     fi
 }
@@ -286,16 +279,13 @@ luci-i18n-base-ru
             || die "Не удалось установить русские пакеты LuCI"
 
     else
-
         die "Не найден ни apk, ни opkg"
     fi
 
     # Явно выбираем русский язык LuCI.
     if uci -q get luci.main >/dev/null 2>&1; then
-
         uci set luci.main.lang='ru'
         uci commit luci
-
     fi
 
     rm -rf /tmp/luci-* 2>/dev/null || true
@@ -352,12 +342,8 @@ configure_firewall() {
     uci set firewall.zerotier.output='ACCEPT'
     uci set firewall.zerotier.forward='ACCEPT'
 
-    # ZeroTier создаёт интерфейс с уникальным именем:
-    #
-    # ztbpaggoh2
-    # ztxxxxxxxx
-    #
-    # Поэтому используем wildcard zt+.
+    # ZeroTier создаёт интерфейс с уникальным именем,
+    # поэтому используем wildcard zt+.
     uci add_list firewall.zerotier.device='zt+'
 
     uci commit firewall
@@ -411,45 +397,6 @@ configure_wifi() {
         || die "Не удалось перезагрузить Wi-Fi"
 
     log "Wi-Fi включён и настроен."
-}
-
-
-# =========================================================
-# SSCLASH
-# =========================================================
-
-install_ssclash() {
-
-    if [ -x /etc/init.d/ssclash ]; then
-
-        log "SSClash уже установлен — пропускаю установку."
-        return 0
-
-    fi
-
-    log "Скачиваю установщик SSClash-Go..."
-
-    rm -f /tmp/install-ssclash-go.sh
-
-    wget -T 30 \
-        -O /tmp/install-ssclash-go.sh \
-        "$SSCLASH_INSTALL_URL" \
-        || die "Не удалось скачать установщик SSClash-Go"
-
-    [ -s /tmp/install-ssclash-go.sh ] \
-        || die "Файл установщика SSClash-Go пуст"
-
-    log "Запускаю установщик SSClash-Go..."
-
-    ash /tmp/install-ssclash-go.sh \
-        || die "Установка SSClash-Go завершилась ошибкой"
-
-    rm -f /tmp/install-ssclash-go.sh
-
-    [ -x /etc/init.d/ssclash ] \
-        || log "ПРЕДУПРЕЖДЕНИЕ: /etc/init.d/ssclash после установки не найден."
-
-    log "Установка SSClash-Go завершена."
 }
 
 
@@ -509,7 +456,7 @@ confirm() {
     echo "WAN firewall:   не открываем"
     echo "Upgrade check:  OFF"
     echo "SSH key:        luci-key"
-    echo "SSClash-Go:     установить"
+    echo "SSClash-Go:     устанавливается вручную"
     echo "======================================="
     echo
 
@@ -649,19 +596,12 @@ set_root_password
 
 
 # =========================================================
-# SSCLASH
-# =========================================================
-
-install_ssclash
-
-
-# =========================================================
 # FINISH
 # =========================================================
 
 log "Базовая подготовка завершена."
-log "Теперь вручную настрой пароль SSClash, шаблон, WARP и VLESS."
-log "После проверки SSClash запусти второй скрипт prepare-for-client.sh."
+log "Теперь вручную установи и настрой SSClash."
+log "После установки и проверки SSClash запусти второй скрипт prepare-for-client.sh."
 
 
 # =========================================================
@@ -681,6 +621,8 @@ echo "  $ZEROTIER_NETWORK_ID"
 echo
 echo "После авторизации роутера в ZeroTier Central"
 echo "можно подключаться к его ZeroTier IP."
+echo
+echo "SSClash устанавливается вручную."
 echo
 echo "Если SSH сейчас оборвётся — это ожидаемо."
 echo "======================================"
